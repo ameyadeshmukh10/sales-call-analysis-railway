@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# --- Data store (CODE-ONLY REPO) ---
+# This repo carries NO call content / PII. The SQLite DB, transcripts, recordings,
+# raw payloads, and derived deliverables all live on the Railway volume
+# (DATA_DIR / OUTPUTS_DIR), never in git. See DEPLOY.md.
+data/
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

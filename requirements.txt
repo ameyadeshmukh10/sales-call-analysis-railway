@@ -1,0 +1,4 @@
+# Core pipeline — works everywhere (local + Linux CI).
+# The Groq transcription backend needs only `requests`; ffmpeg is a system binary.
+requests>=2.31
+python-dotenv>=1.0

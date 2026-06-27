@@ -1,0 +1,4 @@
+# Optional: local on-device transcription with the `mlx` backend.
+# Apple Silicon only. For the hosted `groq` backend you don't need this.
+#   pip install -r requirements-local-stt.txt
+mlx-whisper>=0.4

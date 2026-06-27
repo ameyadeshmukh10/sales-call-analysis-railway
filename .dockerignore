@@ -1,0 +1,27 @@
+# Keep call content / PII out of the image — it lives on the Railway volume.
+data/
+outputs/
+
+# Secrets + local env
+.env
+.env.local
+.env.*.local
+
+# VCS + CI
+.git/
+.github/
+
+# Python caches / virtualenvs
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# OS / tooling cruft
+.DS_Store
+.impeccable/
+
+# NOTE: do NOT ignore *.md — the analysis engine reads agents/*.md, docs/*.md,
+# and .claude/agents/*.md at runtime.

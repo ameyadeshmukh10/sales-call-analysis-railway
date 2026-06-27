@@ -1,0 +1,42 @@
+name: UI Check
+
+# Builds the dashboard's dependencies and renders every page headlessly via
+# Streamlit's AppTest harness against an EMPTY store (this is a code-only repo —
+# call data lives on the Railway volume, not in git). Catches UI regressions on
+# push and proves the app boots cleanly with no data. No secrets needed.
+
+on:
+  push:
+    paths:
+      - "ui/**"
+      - "skills/**"
+      - "pipeline/store.py"
+      - "requirements.txt"
+      - "requirements-ui.txt"
+      - ".github/workflows/ui-check.yml"
+  pull_request:
+    paths:
+      - "ui/**"
+      - "skills/**"
+  workflow_dispatch:
+
+jobs:
+  ui-render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-ui.txt
+
+      - name: Render all pages (AppTest)
+        run: python ui/smoke_test.py

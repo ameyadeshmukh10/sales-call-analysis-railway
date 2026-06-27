@@ -1,0 +1,20 @@
+# EverWorker-branded dark + emerald theme.
+[theme]
+base = "light"
+primaryColor = "#059669"          # emerald
+backgroundColor = "#ffffff"        # white
+secondaryBackgroundColor = "#f1f5f9"
+textColor = "#0f172a"              # near-black
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+
+[client]
+# Hide the Deploy button + developer hamburger; this is an end-user reading surface.
+toolbarMode = "minimal"
+showErrorDetails = "none"
+
+[browser]
+gatherUsageStats = false
