@@ -144,6 +144,11 @@ the dashboard after new calls land (or extend `pipeline/scheduler.py`).
   with CORS/XSRF relaxed for Railway's proxy.
 - **"Claude CLI couldn't authenticate":** confirm `ANTHROPIC_API_KEY` is set on
   the service and the deploy picked it up (redeploy after adding variables).
+- **Analysis fails with "--dangerously-skip-permissions cannot be used with
+  root/sudo":** the container runs as root and Claude Code blocks bypass mode as
+  root. Handled automatically — the app sets `IS_SANDBOX=1` for the analysis
+  subprocess when it detects it's running as root. If you ever see this, make
+  sure you're on the latest image, or add `IS_SANDBOX=1` to the service variables.
 - **Transcription errors:** check `OPENAI_API_KEY` and that `STT_BACKEND=openai`.
   Per-call failures are flagged (`transcript_status=failed`), never fatal.
 - **Data persistence:** data lives on the `/data` volume and survives redeploys.

@@ -74,8 +74,15 @@ def _clean_env() -> dict:
     drop = {"CLAUDECODE"}
     if in_session:
         drop |= {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"}
-    return {k: v for k, v in os.environ.items()
-            if k not in drop and not k.startswith(("CLAUDE_CODE", "CLAUDE_AGENT_SDK"))}
+    env = {k: v for k, v in os.environ.items()
+           if k not in drop and not k.startswith(("CLAUDE_CODE", "CLAUDE_AGENT_SDK"))}
+    # Claude Code refuses `--permission-mode bypassPermissions` when running as
+    # root ("cannot be used with root/sudo privileges") unless it's told it's in a
+    # sandboxed environment. The Railway container runs as root; signal it. No
+    # effect on non-root local dev (getuid != 0), so the guardrail still applies there.
+    if hasattr(os, "getuid") and os.getuid() == 0:
+        env.setdefault("IS_SANDBOX", "1")
+    return env
 
 
 def headless_auth_ready() -> bool:
