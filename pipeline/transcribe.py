@@ -82,6 +82,9 @@ _HOSTED = {
 # the speech is. (GROQ_CHUNK_SECONDS kept for backwards compatibility.)
 CHUNK_SECONDS = int(os.environ.get("STT_CHUNK_SECONDS",
                                    os.environ.get("GROQ_CHUNK_SECONDS", "480")))
+# Hard cap on any single ffmpeg/ffprobe call so a malformed recording can't hang
+# the whole (unattended) batch — a timeout flags that one call 'failed' and moves on.
+FFMPEG_TIMEOUT = int(os.environ.get("FFMPEG_TIMEOUT", "1800"))
 
 
 def _default_model(backend: str) -> str:
@@ -97,14 +100,14 @@ def extract_audio(src_mp4: Path, dest_wav: Path) -> None:
     dest_wav.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["ffmpeg", "-y", "-i", str(src_mp4), "-ac", "1", "-ar", "16000",
            "-vn", str(dest_wav), "-loglevel", "error"]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=FFMPEG_TIMEOUT)
 
 
 def _wav_seconds(wav_path: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=nw=1:nk=1", str(wav_path)],
-        capture_output=True, text=True, check=True)
+        capture_output=True, text=True, check=True, timeout=FFMPEG_TIMEOUT)
     return float(out.stdout.strip())
 
 
@@ -149,7 +152,7 @@ def _transcribe_hosted(wav_path: Path, model: str, *, url: str, api_key: str,
             subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(offset), "-t", str(CHUNK_SECONDS),
                  "-i", str(wav_path), "-ac", "1", "-ar", "16000", "-c:a", "flac",
-                 str(chunk), "-loglevel", "error"], check=True)
+                 str(chunk), "-loglevel", "error"], check=True, timeout=FFMPEG_TIMEOUT)
             resp = _hosted_request(chunk, model, url=url, api_key=api_key, label=label)
             language = language or resp.get("language")
             texts.append((resp.get("text") or "").strip())
@@ -282,7 +285,7 @@ def _probe_seconds(mp4: Path) -> float | None:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nk=1", str(mp4)],
-            capture_output=True, text=True, check=True)
+            capture_output=True, text=True, check=True, timeout=FFMPEG_TIMEOUT)
         return float(out.stdout.strip())
     except Exception:
         return None

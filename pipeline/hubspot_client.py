@@ -235,11 +235,22 @@ class HubSpotClient:
                         continue
                     if r.status_code >= 400:
                         raise HubSpotError(f"download -> {r.status_code}")
+                    expected = int(r.headers.get("Content-Length") or 0)
                     n = 0
                     with open(dest, "wb") as f:
                         for block in r.iter_content(chunk_size=chunk):
                             f.write(block)
                             n += len(block)
+                    if expected and n < expected and attempt < 5:
+                        # short read vs Content-Length -> transient truncation
+                        # (the "partial file" ffmpeg later complains about). Retry
+                        # the whole download.
+                        log.warning("download truncated (%d/%d bytes) on %s; retrying",
+                                    n, expected, dest.name)
+                        time.sleep(min(2 ** attempt, 20))
+                        continue
+                    # Return whatever we have: a full file, or a best-effort
+                    # partial after retries (ffmpeg can still extract its audio).
                     return n
             except requests.RequestException as e:
                 if attempt >= 5:
