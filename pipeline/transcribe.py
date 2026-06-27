@@ -183,7 +183,12 @@ def _hosted_request(audio_path: Path, model: str, *, url: str, api_key: str,
                 time.sleep(min(2 ** attempt, 30))
                 continue
         if r.status_code == 429 and attempt < max_retries:
-            time.sleep(int(r.headers.get("retry-after", "10")))
+            ra = r.headers.get("retry-after", "10")
+            try:
+                wait = float(ra)
+            except (TypeError, ValueError):
+                wait = 10.0  # header may be an HTTP-date; just back off a bit
+            time.sleep(max(1.0, wait))
             continue
         if r.status_code >= 400:
             # never echo the key; body may include rate/limit detail
@@ -239,6 +244,12 @@ def transcribe_call(conn, client: HubSpotClient, call_id: str, recording_url: st
         result = transcribe_audio(wav, backend=backend, model=model)
         norm = _normalize(result, backend=backend, model=model,
                           audio_seconds=audio_seconds)
+        if not norm["turns"]:
+            # No speech/segments returned — don't mark 'present' (the selectors
+            # treat that as done); flag missing so it stays re-attemptable.
+            store.set_call_transcript_state(conn, call_id, status="missing",
+                                            source="none")
+            return "missing", "empty transcript"
         TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
         tpath = TRANSCRIPT_DIR / f"{call_id}.json"
         tpath.write_text(json.dumps(norm, default=str, indent=2))

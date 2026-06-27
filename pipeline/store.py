@@ -159,9 +159,16 @@ def now_iso() -> str:
 @contextmanager
 def connect(db_path: Path | str = DB_PATH):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    # timeout + busy_timeout: competing writers QUEUE instead of erroring with
+    # 'database is locked'. On Railway the scheduler, the Streamlit UI, and the
+    # `claude` analysis subprocess (spawning skills writers) all open this one DB
+    # on the shared volume concurrently.
+    conn = sqlite3.connect(str(db_path), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets readers proceed during writes; the setting persists on the DB file.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
         conn.commit()
@@ -177,17 +184,22 @@ def init_db(db_path: Path | str = DB_PATH) -> None:
 # ---------------- generic idempotent upsert ---------------- #
 
 def _upsert(conn: sqlite3.Connection, table: str, pk: str, row: dict[str, Any]) -> None:
-    """INSERT ... ON CONFLICT(pk) DO UPDATE. Only writes provided columns."""
+    """INSERT ... ON CONFLICT(pk) DO UPDATE/NOTHING. Only writes provided columns."""
     cols = [k for k in row.keys() if row[k] is not None or k == pk]
     if pk not in cols:
         cols.insert(0, pk)
     placeholders = ", ".join("?" for _ in cols)
     col_list = ", ".join(cols)
-    updates = ", ".join(f"{c}=excluded.{c}" for c in cols if c != pk)
-    sql = (
-        f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) "
-        f"ON CONFLICT({pk}) DO UPDATE SET {updates}"
-    )
+    non_pk = [c for c in cols if c != pk]
+    if non_pk:
+        updates = ", ".join(f"{c}=excluded.{c}" for c in non_pk)
+        conflict = f"ON CONFLICT({pk}) DO UPDATE SET {updates}"
+    else:
+        # Only the PK was provided — e.g. a placeholder row for a HubSpot id that
+        # no longer resolves (404). Nothing to update on conflict; inserting the
+        # bare id is enough to satisfy the foreign-key reference.
+        conflict = f"ON CONFLICT({pk}) DO NOTHING"
+    sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) {conflict}"
     conn.execute(sql, [row.get(c) for c in cols])
 
 
@@ -286,7 +298,11 @@ def set_watermark(conn, object_type: str, watermark: str | None, n_seen: int,
         "VALUES (?, ?, ?, ?, ?) "
         "ON CONFLICT(object_type) DO UPDATE SET "
         "last_run_at=excluded.last_run_at, "
-        "last_modified_watermark=excluded.last_modified_watermark, "
+        # Preserve the prior cursor when this run observed no new rows (NULL) —
+        # otherwise a steady-state incremental run would reset the watermark and
+        # re-pull the whole history next time.
+        "last_modified_watermark=COALESCE(excluded.last_modified_watermark, "
+        "ingest_state.last_modified_watermark), "
         "n_seen=excluded.n_seen, notes=excluded.notes",
         (object_type, now_iso(), watermark, n_seen, notes),
     )

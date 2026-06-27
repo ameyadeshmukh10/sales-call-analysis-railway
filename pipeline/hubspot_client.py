@@ -34,6 +34,29 @@ class HubSpotError(RuntimeError):
     pass
 
 
+def _retry_after_seconds(val, default: float = 10.0) -> float:
+    """Parse a Retry-After header (delta-seconds OR an HTTP-date) into a float,
+    falling back to `default` on anything unparseable — so a 429 never crashes
+    the retry loop with a ValueError."""
+    if not val:
+        return default
+    try:
+        return max(0.0, float(val))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(val)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+    except Exception:
+        pass
+    return default
+
+
 class HubSpotClient:
     def __init__(self, token: str | None = None, base_url: str | None = None,
                  timeout: int = 30):
@@ -68,7 +91,7 @@ class HubSpotClient:
                 continue
 
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", "10"))
+                wait = _retry_after_seconds(r.headers.get("Retry-After"))
                 log.warning("rate-limited on %s; sleeping %ss", path, wait)
                 time.sleep(wait)
                 continue
@@ -82,7 +105,14 @@ class HubSpotClient:
                 return r
             if not r.content:
                 return {}
-            return r.json()
+            try:
+                return r.json()
+            except ValueError as e:
+                # 2xx with a non-JSON body (e.g. an edge/interstitial HTML page).
+                # Funnel into the HubSpotError path callers already handle.
+                raise HubSpotError(
+                    f"{method} {path} -> {r.status_code} non-JSON body: "
+                    f"{r.text[:200]}") from e
 
     # ---------- list / search pagination ---------- #
     def search(self, object_type: str, *, properties: list[str],
@@ -136,7 +166,13 @@ class HubSpotClient:
         out: list[dict] = []
         for chunk in _chunks(ids, 100):
             body = {"properties": properties, "inputs": [{"id": x} for x in chunk]}
-            data = self.request("POST", path, json_body=body)
+            try:
+                data = self.request("POST", path, json_body=body)
+            except HubSpotError as e:
+                # Skip a bad chunk rather than aborting the whole ingest.
+                log.warning("batch_read %s: skipping chunk of %d (%s)",
+                            object_type, len(chunk), e)
+                continue
             out.extend(data.get("results", []))
         return out
 
@@ -147,7 +183,13 @@ class HubSpotClient:
         path = f"/crm/v4/associations/{from_type}/{to_type}/batch/read"
         for chunk in _chunks(ids, 1000):
             body = {"inputs": [{"id": x} for x in chunk]}
-            data = self.request("POST", path, json_body=body)
+            try:
+                data = self.request("POST", path, json_body=body)
+            except HubSpotError as e:
+                # A failed chunk -> those ids get no associations; don't abort.
+                log.warning("associations %s->%s: skipping chunk of %d (%s)",
+                            from_type, to_type, len(chunk), e)
+                continue
             for rec in data.get("results", []):
                 src = rec["from"]["id"]
                 out[src] = [t["toObjectId"] for t in rec.get("to", [])]
@@ -189,7 +231,7 @@ class HubSpotClient:
                 with self.session.get(url, stream=True, timeout=self.timeout,
                                       headers=headers, allow_redirects=True) as r:
                     if r.status_code == 429 and attempt < 5:
-                        time.sleep(int(r.headers.get("Retry-After", "10")))
+                        time.sleep(_retry_after_seconds(r.headers.get("Retry-After")))
                         continue
                     if r.status_code >= 400:
                         raise HubSpotError(f"download -> {r.status_code}")

@@ -95,18 +95,30 @@ def _to_float(v):
 def ingest(window_start: str | None = None, window_end: str | None = None,
            incremental: bool = False, limit: int | str = "all") -> dict:
     window_start = window_start or os.environ.get("INGEST_WINDOW_START", "2026-05-01")
-    window_end = window_end or os.environ.get("INGEST_WINDOW_END", "2026-06-01")
-    lo, hi = str(date_to_ms(window_start)), str(date_to_ms(window_end))
+    # window_end is optional. Incremental/scheduled runs IGNORE it and use an
+    # open-ended upper bound (below) so calls after it still flow in.
+    window_end = window_end or os.environ.get("INGEST_WINDOW_END")
+    lo = str(date_to_ms(window_start))
 
     store.init_db()
     client = HubSpotClient()
-    stage_label, stage_closed, stage_won, pipeline_label = _resolve_stage_maps(client)
+    try:
+        stage_label, stage_closed, stage_won, pipeline_label = _resolve_stage_maps(client)
+    except HubSpotError as e:
+        log.warning("pipeline stage maps unresolved, using raw stage ids: %s", e)
+        stage_label, stage_closed, stage_won, pipeline_label = {}, {}, {}, {}
     disp_labels = _disposition_labels(client)
 
     # recorded_calls view = timestamp in window AND (has transcript OR has recording).
     # Two filterGroups -> OR between them, AND within each.
-    base_ts = {"propertyName": "hs_timestamp", "operator": "BETWEEN",
-               "value": lo, "highValue": hi}
+    if incremental or not window_end:
+        # Open-ended upper bound; the hs_lastmodifieddate watermark filter (added
+        # below) is what actually bounds an incremental re-pull. A fixed past
+        # window_end would silently stop ingesting any newer calls.
+        base_ts = {"propertyName": "hs_timestamp", "operator": "GTE", "value": lo}
+    else:
+        base_ts = {"propertyName": "hs_timestamp", "operator": "BETWEEN",
+                   "value": lo, "highValue": str(date_to_ms(window_end))}
     filter_groups = [
         {"filters": [base_ts, {"propertyName": "hs_call_has_transcript",
                                "operator": "EQ", "value": "true"}]},
@@ -158,20 +170,27 @@ def ingest(window_start: str | None = None, window_end: str | None = None,
                "n_owners": len(owner_ids), "with_transcript_flag": 0,
                "with_recording_url": 0, "deal_outcomes": {}}
 
+    # Resolve owners (network I/O) BEFORE opening the write transaction, so the
+    # SQLite write lock isn't held across HubSpot round-trips (keeps the lock
+    # short for the concurrent scheduler / UI / analysis writers).
+    owner_rows = []
+    for oid in owner_ids:
+        try:
+            o = client.get_owner(oid)
+            fn, ln = o.get("firstName"), o.get("lastName")
+            owner_rows.append({
+                "owner_id": oid, "first_name": fn, "last_name": ln,
+                "full_name": " ".join(x for x in [fn, ln] if x) or o.get("email"),
+                "email": o.get("email"),
+                "raw_json_path": _save_raw("owners", oid, o)})
+        except HubSpotError as e:
+            log.warning("owner %s unresolved: %s", oid, e)
+            owner_rows.append({"owner_id": oid, "full_name": None})
+
     with store.connect() as conn:
         # owners
-        for oid in owner_ids:
-            try:
-                o = client.get_owner(oid)
-                fn, ln = o.get("firstName"), o.get("lastName")
-                store.upsert_owner(conn, {
-                    "owner_id": oid, "first_name": fn, "last_name": ln,
-                    "full_name": " ".join(x for x in [fn, ln] if x) or o.get("email"),
-                    "email": o.get("email"),
-                    "raw_json_path": _save_raw("owners", oid, o)})
-            except HubSpotError as e:
-                log.warning("owner %s unresolved: %s", oid, e)
-                store.upsert_owner(conn, {"owner_id": oid, "full_name": None})
+        for row in owner_rows:
+            store.upsert_owner(conn, row)
 
         # contacts
         for c in contacts:
@@ -242,7 +261,9 @@ def ingest(window_start: str | None = None, window_end: str | None = None,
                 "transcription_id": p.get("hs_call_transcription_id"),
                 "has_transcript": int(has_tr),
                 "has_voicemail": int(str(p.get("hs_call_has_voicemail", "")).lower() == "true"),
-                "owner_id": p.get("hubspot_owner_id"),
+                # Normalize "" -> None so the FK (-> owners) stays satisfiable;
+                # empty owner ids are filtered out of the owners table above.
+                "owner_id": (p.get("hubspot_owner_id") or None),
                 "transcript_status": t_status,
                 "raw_json_path": _save_raw("calls", c["id"], c),
                 "ingested_at": store.now_iso()})
@@ -254,10 +275,10 @@ def ingest(window_start: str | None = None, window_end: str | None = None,
                 store.link(conn, "call_deals", "call_id", c["id"], "deal_id", did)
 
         store.set_watermark(conn, "calls", watermark, len(calls),
-                            notes=f"window {window_start}..{window_end}")
+                            notes=f"window {window_start}..{window_end or 'open'}")
 
     summary["watermark"] = watermark
-    summary["window"] = f"{window_start}..{window_end}"
+    summary["window"] = f"{window_start}..{window_end or 'open'}"
     return summary
 
 

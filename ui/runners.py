@@ -12,6 +12,7 @@ Everything launches in the background, streaming to a logfile under
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,9 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUN_DIR = REPO_ROOT / "data" / "ui_runs"
+# Honor DATA_DIR so run logs land on the same (volume) store the scheduler writes
+# to — keeps UI + scheduler run logs in one place and persistent across redeploys.
+RUN_DIR = Path(os.environ.get("DATA_DIR", str(REPO_ROOT / "data"))) / "ui_runs"
 
 ANALYSIS_AGENTS = [
     "speaker_attribution", "rep_talk_extraction", "customer_voice_extraction",
@@ -42,7 +45,13 @@ def launch(cmd: list[str], label: str, env: dict | None = None) -> dict:
     logf = open(log_path, "w")
     logf.write(f"$ {' '.join(cmd)}\n\n")
     logf.flush()
-    proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), stdout=logf,
+    # Wrap so the REAL exit code lands in the log; poll() trusts it instead of
+    # guessing from log text. `bash -c '... "$@" ...' _ <cmd...>` forwards argv
+    # unquoted, so the large analysis prompt needs no shell escaping.
+    wrapped = ["bash", "-c",
+               'set +e; "$@"; ec=$?; echo "__EXIT_CODE__=${ec}__"; exit $ec',
+               "_", *cmd]
+    proc = subprocess.Popen(wrapped, cwd=str(REPO_ROOT), stdout=logf,
                             stderr=subprocess.STDOUT, start_new_session=True, env=env)
     meta = {"run_id": run_id, "label": label, "cmd": cmd, "pid": proc.pid,
             "status": "running", "started_at": time.time(), "log": str(log_path)}
@@ -87,29 +96,60 @@ def poll(run_id: str) -> dict:
     meta = json.loads(meta_path.read_text())
     if meta.get("status") == "running":
         if not _pid_alive(meta["pid"]):
-            # process ended — infer success/failure from log tail
-            tail = read_log(run_id, 600).lower()
-            meta["status"] = "failed" if ("traceback" in tail or "error:" in tail) else "done"
+            # process ended — trust the recorded exit code if present, else fall
+            # back to a conservative log-tail heuristic.
+            import re
+            tail = read_log(run_id, 4000)
+            m = re.search(r"__EXIT_CODE__=(\d+)__", tail)
+            if m:
+                meta["status"] = "done" if m.group(1) == "0" else "failed"
+            else:
+                low = tail.lower()
+                meta["status"] = "failed" if (
+                    "traceback (most recent call last)" in low
+                    or "command not found" in low) else "done"
             meta["ended_at"] = time.time()
             meta_path.write_text(json.dumps(meta))
     return meta
 
 
-def _pid_alive(pid: int) -> bool:
-    """True only if pid is alive AND looks like one of our launched jobs
-    (python / claude / bash). Guards against PID reuse falsely showing 'running'."""
+def _proc_cmdline(pid: int) -> str | None:
+    """Process cmdline (lowercased, space-joined) via /proc on Linux; None when
+    /proc isn't available (e.g. macOS) so the caller can fall back."""
     import os
-    import subprocess
+    if not os.path.isdir("/proc"):
+        return None
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().replace(b"\x00", b" ").decode(errors="ignore").strip().lower()
+    except FileNotFoundError:
+        return ""  # pid dir gone -> not alive
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """True only if pid is alive AND looks like one of our launched jobs.
+    Guards against PID reuse and against a reaped/zombie child (whose /proc
+    cmdline is empty) falsely reading as 'running' forever. The Railway image is
+    slim and has no `ps`, so prefer /proc."""
+    import os
     try:
         os.kill(pid, 0)
     except (OSError, ProcessLookupError):
         return False
-    try:
-        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                             capture_output=True, text=True, timeout=5).stdout.lower()
-    except Exception:
-        return True  # can't verify; assume alive rather than kill a real run
-    return any(m in cmd for m in ("python", "claude", "streamlit", "bash -lc"))
+    cmd = _proc_cmdline(pid)
+    if cmd is None:
+        # No /proc (macOS local dev): try ps, else trust os.kill.
+        import subprocess
+        try:
+            cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                                 capture_output=True, text=True, timeout=5).stdout.lower()
+        except Exception:
+            return True
+    if not cmd:
+        return False  # zombie / reaped -> empty cmdline
+    return any(m in cmd for m in ("python", "claude", "streamlit", "bash"))
 
 
 def stop(run_id: str) -> bool:
